@@ -1,4 +1,4 @@
-# 🎓 ScodocPatcher
+# 🎓 ScodocPatcher extension Chrome
 
 ## 1. Installation 🛠️
 
