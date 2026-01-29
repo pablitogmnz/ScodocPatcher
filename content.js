@@ -101,12 +101,18 @@ function scanAndCalculate() {
     let newPatches = 0;
 
     ueHeaders.forEach(header => {
+        // FILTER: Ignore Bonus UEs
+        if (header.classList.contains('ueBonus')) return;
+
         const container = header.parentElement;
         if (!container) return;
 
         const moyenneEl = header.querySelector('.moyenne');
         // Nom UE nettoyage
         const ueName = header.innerText.split('\n')[0].trim(); // Ex: UE4.01_D ...
+
+        // FILTER: Double security, standard UEs start with "UE"
+        if (!ueName.toUpperCase().startsWith('UE')) return;
 
         const modules = container.querySelectorAll(CONFIG.ITEM_SELECTOR);
         const grades = [];
