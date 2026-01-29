@@ -1,112 +1,182 @@
-console.log("Extension ScodocPatcher chargée");
+console.log(`[ScodocPatcher] Actif.`);
 
-function scanPage() {
-    console.log("Analyse de la page pour les notes...");
+let observer = null;
+let scodocTimeout = null;
+let lastLogTime = 0;
 
-    // Fonction utilitaire pour nettoyer le texte
-    const cleanText = (text) => text ? text.trim().replace(/\s+/g, ' ') : '';
+// Configuration
+const CONFIG = {
+    HOST_SELECTOR: 'releve-but', // Le Web Component
+    ITEM_SELECTOR: '.syntheseModule',
+    UE_HEADER_SELECTOR: '.ue',
+    NOTE_PATTERN: /(?:^|\s|:)(~|[0-9]{1,2}(?:[\.,][0-9]{0,2})?)(?:\s|$)/,
+    COEF_PATTERN: /Coef\.?\s*(\d+)/i,
+    STYLE: {
+        PASS: 'color: #2ecc71; font-weight: bold;',
+        FAIL: 'color: #e74c3c; font-weight: bold;'
+    }
+};
 
-    // Stratégie : Trouver tous les éléments susceptibles d'être des en-têtes d'UE ou des lignes de notes
-    // Comme nous n'avons pas de classes, nous scannons les conteneurs génériques susceptibles de contenir du texte
-    // Nous itérons sur tous les éléments structurels (div, tr, p, li, td)
-    const candidates = document.querySelectorAll('div, tr, p, li, td, h1, h2, h3, h4');
+function parseFloatLocal(str) {
+    if (!str) return null;
+    return parseFloat(str.replace(',', '.'));
+}
 
-    let currentUE = null;
-    const structure = [];
+function calculateUEAverage(grades) {
+    let sum = 0;
+    let weightSum = 0;
 
-    // Concepts Regex
-    const ueRegex = /UE\s*\d+(\.\d+)?/i; // Correspond à "UE 3", "UE3.1", "UE 3.2"
-    const coefRegex = /Coef\.?\s*(\d+)/i; // Correspond à "Coef. 15", "Coef 4"
-
-    candidates.forEach(element => {
-        // Optimisation : Ignorer les éléments avec trop d'enfants pour éviter de re-traiter les parents des enfants trouvés
-        // Mais il faut être prudent. Regardons les nœuds feuilles ou les nœuds avec du contenu textuel direct.
-        // En fait, une itération simple de haut en bas pourrait compter doublon. 
-        // Meilleure stratégie : Chercher les nœuds texte ? 
-        // Restons sur l'indication de l'utilisateur : "blocs UE" et "Lignes de Notes".
-
-        const text = cleanText(element.innerText);
-
-        // 1. Vérifier si c'est un Bloc UE
-        // Il doit contenir "UE" + nombre. 
-        // Pour éviter les faux positifs (comme tout le body), vérifions si le texte générique *commence* par ou constitue la majeure partie du contenu, 
-        // ou s'il s'agit d'une cellule d'en-tête spécifique.
-        // Heuristique : Texte assez court contenant le motif.
-        if (ueRegex.test(text) && text.length < 100) {
-            // C'est un potentiel en-tête d'UE.
-            // Mais vérifions que nous ne l'avons pas déjà traité via un parent.
-            // Pour l'instant, loggons-le simplement.
-            const match = text.match(ueRegex);
-            currentUE = {
-                name: match[0],
-                element: element,
-                grades: []
-            };
-            structure.push(currentUE);
-            // console.log("UE trouvée :", currentUE.name);
-            return; // Ne pas traiter cet élément comme une ligne de note si c'est un en-tête
+    grades.forEach(g => {
+        if (g.note !== null) {
+            sum += g.note * g.coef;
+            weightSum += g.coef;
         }
+    });
 
-        // 2. Vérifier si c'est une Ligne de Note
-        // Doit avoir "Coef." + nombre.
-        if (currentUE && coefRegex.test(text)) {
-            // Elle appartient à la dernière UE trouvée.
-            // Nous devons vérifier la duplication. Si 'tr' l'a, 'td' dedans pourrait aussi l'avoir.
-            // Nous préférons le conteneur qui a à la fois la note et le coef ? 
-            // Ou juste la ligne.
-            // Stockons-le.
+    if (weightSum === 0) return null;
+    return sum / weightSum;
+}
 
-            // Éviter d'ajouter la même ligne visuelle plusieurs fois (ex: TR et TD)
-            // Si l'élément est un enfant du dernier élément de note de l'UE actuelle, ignorer ?
-            // Déduplication simple : Vérifier si cet élément contient le *même* texte que la dernière note ajoutée ?
+function injectScore(element, average) {
+    if (average === null) return;
 
-            // Acceptons strictement : "Coef." est présent.
-            // Nous voulons aussi capturer la note. La note peut être "14.5" ou "~".
+    // Vérifier si déjà patché pour éviter de re-traiter
+    if (element.getAttribute('data-scodoc-patched') === 'true') return;
 
-            // Extrayons les données brutes
-            const coefMatch = text.match(coefRegex);
-            const coef = coefMatch ? parseInt(coefMatch[1], 10) : 0;
+    const formatted = average.toFixed(2);
+    const style = average >= 10 ? CONFIG.STYLE.PASS : CONFIG.STYLE.FAIL;
+    element.innerHTML = element.innerHTML.replace('~', `<span style="${style}">${formatted}</span>`);
+    element.setAttribute('data-scodoc-patched', 'true');
+}
 
-            // La détection de note est délicate sans sélecteur. C'est "potentiellement une note".
-            // Nous chercherons un motif numérique XX.XX ou ~
-            // La note est généralement proche du Coef.
+function updateGeneralAverage(ueAverages) {
+    const validAverages = ueAverages.filter(a => a !== null);
+    if (validAverages.length === 0) return 0;
 
-            const gradeItem = {
-                element: element,
-                rawText: text,
-                coef: coef
-            };
+    const generalAvg = validAverages.reduce((a, b) => a + b, 0) / validAverages.length;
 
-            // Stratégie de déduplication simple :
-            // Si cet élément contient le *même* coef et est à l'intérieur de l'élément précédent, 
-            // peut-être voulons-nous le plus spécifique (enfant) ou la ligne (parent).
-            // L'utilisateur a dit "Lignes de Notes".
+    // Widget Moyenne Générale
+    let widget = document.getElementById('scodoc-patcher-widget');
+    if (!widget) {
+        widget = document.createElement('div');
+        widget.id = 'scodoc-patcher-widget';
+        widget.style.cssText = `
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(33, 37, 41, 0.95);
+            color: white;
+            padding: 15px 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            font-family: sans-serif;
+            z-index: 9999;
+            text-align: center;
+        `;
+        document.body.appendChild(widget);
+    }
 
-            // Ajoutons toute la logique d'implémentation plus tard, pour l'instant collectons juste les "Lignes"
-            // Nous filtrons si l'élément est trop grand (comme la table elle-même)
-            if (text.length < 200) {
-                // Vérifier si nous venons d'ajouter cet élément exact ou un parent
-                const lastGrade = currentUE.grades[currentUE.grades.length - 1];
-                if (!lastGrade || !lastGrade.element.contains(element)) {
-                    currentUE.grades.push(gradeItem);
-                }
+    const style = generalAvg >= 10 ? '#2ecc71' : '#e74c3c';
+    widget.innerHTML = `
+        <div style="font-size: 0.9em; opacity: 0.8; margin-bottom: 5px;">MOYENNE GÉNÉRALE</div>
+        <div style="font-size: 1.8em; font-weight: bold; color: ${style}">${generalAvg.toFixed(2)}</div>
+        <div style="font-size: 0.8em; opacity: 0.6; margin-top: 5px;">${validAverages.length} UEs prises en compte</div>
+    `;
+
+    return generalAvg;
+}
+
+function scanAndCalculate() {
+    // Shadow DOM Init
+    const hostElement = document.querySelector(CONFIG.HOST_SELECTOR);
+    if (!hostElement || !hostElement.shadowRoot) return;
+
+    const root = hostElement.shadowRoot;
+    const ueHeaders = root.querySelectorAll(CONFIG.UE_HEADER_SELECTOR);
+
+    if (ueHeaders.length === 0) return;
+
+    const ueResults = [];
+    const ueAverages = [];
+    let newPatches = 0;
+
+    ueHeaders.forEach(header => {
+        const container = header.parentElement;
+        if (!container) return;
+
+        const moyenneEl = header.querySelector('.moyenne');
+        // Nom UE nettoyage
+        const ueName = header.innerText.split('\n')[0].trim(); // Ex: UE4.01_D ...
+
+        const modules = container.querySelectorAll(CONFIG.ITEM_SELECTOR);
+        const grades = [];
+
+        modules.forEach(mod => {
+            const text = mod.innerText;
+            const em = mod.querySelector('em');
+            const coefText = em ? em.innerText : '';
+
+            let textForGrade = text;
+            if (em) textForGrade = text.replace(coefText, '');
+
+            const match = textForGrade.match(CONFIG.NOTE_PATTERN);
+            let note = null;
+            if (match && match[1] !== '~') {
+                note = parseFloatLocal(match[1]);
+            }
+
+            let coef = 1;
+            const coefMatch = coefText.match(CONFIG.COEF_PATTERN);
+            if (coefMatch) coef = parseInt(coefMatch[1], 10);
+
+            grades.push({ note, coef });
+        });
+
+        const avg = calculateUEAverage(grades);
+        ueAverages.push(avg);
+
+        if (avg !== null) {
+            ueResults.push({
+                'UE': ueName,
+                'Moyenne': avg.toFixed(2)
+            });
+
+            if (moyenneEl && moyenneEl.getAttribute('data-scodoc-patched') !== 'true') {
+                injectScore(moyenneEl, avg);
+                newPatches++;
             }
         }
     });
 
-    console.log("--- Analyse ScodocPatcher ---");
-    console.log("Structure Trouvée :", structure);
+    if (ueResults.length > 0) {
+        const generalAvg = updateGeneralAverage(ueAverages);
 
-    // Tableau Console pour une meilleure visibilité
-    const exportData = structure.flatMap(ue =>
-        ue.grades.map(g => ({
-            UE: ue.name,
-            Texte: g.rawText.substring(0, 50) + "...",
-            Coef: g.coef
-        }))
-    );
-    console.table(exportData);
+        // Log seulement si on a fait de nouveaux patchs ou pas loggé depuis longtemps (evite spam loop)
+        const now = Date.now();
+        if (newPatches > 0) {
+            console.clear(); // Nettoie pour voir clair comme demandé
+            console.log("--- Bilan ScodocPatcher ---");
+            console.table(ueResults);
+            console.log(`%c Moyenne Générale : ${generalAvg.toFixed(2)} `, "background: #222; color: #bada55; font-size: 16px; padding: 4px; border-radius: 4px;");
+            lastLogTime = now;
+        }
+    }
 }
 
-// Lancer quand le DOM est prêt (manifest run_at document_idle gère généralement ça, mais un délai aide pour les SPA)
-setTimeout(scanPage, 1000);
+// Observer sur le body pour détecter l'apparition du Web Component ou modifs
+observer = new MutationObserver(() => {
+    // Debounce
+    if (scodocTimeout) clearTimeout(scodocTimeout);
+    scodocTimeout = setTimeout(scanAndCalculate, 1000);
+});
+
+if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+} else {
+    window.addEventListener('DOMContentLoaded', () => {
+        observer.observe(document.body, { childList: true, subtree: true });
+    });
+}
+
+// Trigger initial
+setTimeout(scanAndCalculate, 1500);
